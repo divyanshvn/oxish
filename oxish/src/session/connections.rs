@@ -10,6 +10,7 @@ use core::{
 use std::{
     borrow::Cow,
     collections::{BTreeMap, btree_map::Entry},
+    io,
     time::Instant,
 };
 
@@ -18,11 +19,11 @@ use proto::{
     auth::KeyOptions,
     channels::{
         ChannelClose, ChannelData, ChannelEof, ChannelOpen, ChannelOpenConfirmation,
-        ChannelOpenFailure, ChannelRequest, ChannelRequestFailure, ChannelRequestSuccess,
-        ChannelRequestType, ChannelWindowAdjust, PtyReq,
+        ChannelOpenFailure, ChannelOpenType, ChannelRequest, ChannelRequestFailure,
+        ChannelRequestSuccess, ChannelRequestType, ChannelWindowAdjust, DirectTcpip, PtyReq,
     },
-    named::ChannelType,
 };
+use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use crate::{Error, platform::Terminal};
@@ -39,13 +40,40 @@ impl Channels {
         open: ChannelOpen<'_>,
         write: &mut WriteState,
     ) -> Result<(), Error> {
-        if open.r#type != ChannelType::Session {
-            write.encode(&ChannelOpenFailure::unknown_type(open.sender_channel))?;
-            return Ok(());
-        }
+        let kind = match open.r#type {
+            ChannelOpenType::Session => ChannelKind::Session(Box::default()),
+            ChannelOpenType::DirectTcpip(destination) => {
+                if !TcpConnection::valid_destination(&destination, open.maximum_packet_size) {
+                    write.encode(&ChannelOpenFailure::administratively_prohibited(
+                        open.sender_channel,
+                        "invalid TCP destination or channel parameters",
+                    ))?;
+                    return Ok(());
+                }
+                let host = destination.host.to_owned();
+                let port = destination.port as u16;
+                ChannelKind::Tcp(TcpConnection::Connecting(Box::pin(async move {
+                    tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+                        .await
+                        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+                })))
+            }
+            _ => {
+                write.encode(&ChannelOpenFailure::unknown_type(open.sender_channel))?;
+                return Ok(());
+            }
+        };
 
         if self.channels.len() + 1 >= MAX_OPEN_CHANNELS_PER_SESSION {
-            write.encode(&ChannelOpenFailure::connect_failed(open.sender_channel))?;
+            write.encode(&ChannelOpenFailure::resource_shortage(open.sender_channel))?;
+            return Ok(());
+        }
+        if self
+            .channels
+            .values()
+            .any(|channel| channel.flow.remote_id == open.sender_channel)
+        {
+            write.encode(&ChannelOpenFailure::duplicate_id(open.sender_channel))?;
             return Ok(());
         }
 
@@ -60,16 +88,20 @@ impl Channels {
         };
 
         let channel = entry.insert(Channel {
-            remote_id: open.sender_channel,
-            send_window: open.initial_window_size,
-            receive_window: 0,
-            maximum_packet_size: open.maximum_packet_size,
-            env: Vec::new(),
-            terminal: None,
-            close_sent: false,
+            flow: ChannelFlow {
+                remote_id: open.sender_channel,
+                send_window: open.initial_window_size,
+                receive_window: 0,
+                maximum_packet_size: open.maximum_packet_size,
+                close_sent: false,
+            },
+            kind,
         });
 
-        write.encode(&channel.confirmation(local_id))?;
+        // TODO: why only confirmation for Session?
+        if matches!(channel.kind, ChannelKind::Session(_)) {
+            write.encode(&channel.confirmation(local_id))?;
+        }
         Ok(())
     }
 
@@ -84,18 +116,25 @@ impl Channels {
             return Err(ProtoError::InvalidPacket("channel request for unknown channel ID").into());
         };
 
+        let ChannelKind::Session(session) = &mut channel.kind else {
+            if request.want_reply {
+                write.encode(&channel.failure())?;
+            }
+            return Ok(());
+        };
+
         match request.r#type {
             ChannelRequestType::PtyReq(pty_req) => {
-                channel.terminal = Some(TerminalState::Requested(pty_req.into_owned()));
+                session.terminal = Some(TerminalState::Requested(pty_req.into_owned()));
             }
             ChannelRequestType::Env(env) => {
                 const ALLOW_ENV: &[&str] = &["TZ", "LANG"];
                 match ALLOW_ENV.contains(&env.name) || env.name.starts_with("LC_") {
-                    true if channel.env.len() < MAX_ENV_VARIABLE_COUNT
+                    true if session.env.len() < MAX_ENV_VARIABLE_COUNT
                         && env.name.len() <= MAX_ENV_VARIABLE_NAME_LEN
                         && env.value.len() <= MAX_ENV_VARIABLE_VALUE_LEN =>
                     {
-                        channel
+                        session
                             .env
                             .push((env.name.to_owned(), env.value.to_owned()))
                     }
@@ -109,7 +148,7 @@ impl Channels {
                 }
             }
             ChannelRequestType::Shell => {
-                let Some(TerminalState::Requested(pty_req)) = channel.terminal.take() else {
+                let Some(TerminalState::Requested(pty_req)) = session.terminal.take() else {
                     return Err(
                         ProtoError::InvalidPacket("shell request without prior pty-req").into(),
                     );
@@ -132,10 +171,10 @@ impl Channels {
                     return Ok(());
                 };
 
-                let pty_req = match channel.terminal.take() {
+                let pty_req = match session.terminal.take() {
                     Some(TerminalState::Requested(pty_req)) => pty_req,
                     state => {
-                        channel.terminal = state;
+                        session.terminal = state;
                         // TODO: support non-PTY exec channel also
                         warn!(channel_id = %request.recipient_channel, "refusing exec request without pending pty-req");
                         if request.want_reply {
@@ -149,7 +188,7 @@ impl Channels {
                     Some(command) => {
                         info!(channel_id = %request.recipient_channel, command, "running forced command from authorized key");
                         // Clients cannot set this themselves, see `ALLOW_ENV`
-                        channel
+                        session
                             .env
                             .push((ORIGINAL_COMMAND_ENV.to_owned(), requested.to_owned()));
                         command
@@ -159,7 +198,7 @@ impl Channels {
 
                 channel.start_terminal(Some(command), &pty_req, write)?;
             }
-            ChannelRequestType::WindowChange(window_change) => match &channel.terminal {
+            ChannelRequestType::WindowChange(window_change) => match &session.terminal {
                 Some(TerminalState::Running(terminal)) => terminal.resize(&window_change)?,
                 _ => warn!("window-change request without running terminal"),
             },
@@ -195,13 +234,13 @@ impl Channels {
             return Ok(());
         };
 
-        let Some(window) = channel.send_window.checked_sub(banner.len() as u32) else {
+        let Some(window) = channel.flow.send_window.checked_sub(banner.len() as u32) else {
             return Ok(());
         };
 
-        channel.send_window = window;
+        channel.flow.send_window = window;
         write.encode(&ChannelData {
-            recipient_channel: channel.remote_id,
+            recipient_channel: channel.flow.remote_id,
             data: Cow::Borrowed(banner.as_bytes()),
         })?;
         Ok(())
@@ -214,11 +253,11 @@ impl Channels {
             ));
         };
 
-        if u32::MAX - channel.send_window < adjust.bytes_to_add {
+        if u32::MAX - channel.flow.send_window < adjust.bytes_to_add {
             debug!(channel_id = %adjust.recipient_channel, "window adjust would overflow; capping");
         }
 
-        channel.send_window = channel.send_window.saturating_add(adjust.bytes_to_add);
+        channel.flow.send_window = channel.flow.send_window.saturating_add(adjust.bytes_to_add);
         Ok(())
     }
 
@@ -233,8 +272,18 @@ impl Channels {
             ));
         };
 
-        match channel.receive_window.checked_sub(data.data.len() as u32) {
-            Some(window) => channel.receive_window = window,
+        let ChannelKind::Session(session) = &mut channel.kind else {
+            return Err(ProtoError::InvalidPacket(
+                "TCP relay is not yet implemented",
+            ));
+        };
+
+        match channel
+            .flow
+            .receive_window
+            .checked_sub(data.data.len() as u32)
+        {
+            Some(window) => channel.flow.receive_window = window,
             None => {
                 return Err(ProtoError::InvalidPacket(
                     "channel data exceeds receive window",
@@ -242,18 +291,18 @@ impl Channels {
             }
         }
 
-        if channel.receive_window < INITIAL_WINDOW_SIZE / 2 {
+        if channel.flow.receive_window < INITIAL_WINDOW_SIZE / 2 {
             debug!(channel_id = %data.recipient_channel, "receive window low; sending window adjust");
-            let bytes_to_add = INITIAL_WINDOW_SIZE - channel.receive_window;
-            channel.receive_window = INITIAL_WINDOW_SIZE;
+            let bytes_to_add = INITIAL_WINDOW_SIZE - channel.flow.receive_window;
+            channel.flow.receive_window = INITIAL_WINDOW_SIZE;
             write.encode(&ChannelWindowAdjust {
-                recipient_channel: channel.remote_id,
+                recipient_channel: channel.flow.remote_id,
                 bytes_to_add,
             })?;
         }
 
         debug!(len = %data.data.len(), "received channel data");
-        Ok(match &mut channel.terminal {
+        Ok(match &mut session.terminal {
             Some(TerminalState::Running(terminal)) => Some((terminal, &data.data)),
             _ => None,
         })
@@ -280,18 +329,27 @@ impl Channels {
             return Ok(());
         };
 
+        if matches!(channel.kind, ChannelKind::Tcp(TcpConnection::Connecting(_))) {
+            return Err(ProtoError::InvalidPacket("channel close before confirmation").into());
+        }
+
         // Reply with our own close if we haven't sent one already.
-        if !channel.close_sent {
-            channel.close_sent = true;
+        if !channel.flow.close_sent {
+            channel.flow.close_sent = true;
             write.encode(&ChannelClose {
-                recipient_channel: channel.remote_id,
+                recipient_channel: channel.flow.remote_id,
             })?;
         }
 
+        let ChannelKind::Session(session) = &mut channel.kind else {
+            self.channels.remove(&close.recipient_channel);
+            return Ok(());
+        };
+
         // The client is no longer listening for output or exit status. Kill the shell,
-        // but keep the channel around so `TerminalsFuture` can reap the process before
+        // but keep the channel around so the polling loop can reap the process before
         // the channel is dropped.
-        match channel.terminal.take() {
+        match session.terminal.take() {
             Some(
                 TerminalState::Running(mut terminal)
                 | TerminalState::Exiting {
@@ -301,12 +359,12 @@ impl Channels {
             ) => {
                 debug!(channel_id = %close.recipient_channel, "received channel close from client; killing shell");
                 terminal.start_kill();
-                channel.terminal = Some(TerminalState::Reaping {
+                session.terminal = Some(TerminalState::Reaping {
                     terminal,
                     deadline: Instant::now() + EXIT_GRACE_PERIOD,
                 });
             }
-            state @ Some(TerminalState::Reaping { .. }) => channel.terminal = state,
+            state @ Some(TerminalState::Reaping { .. }) => session.terminal = state,
             Some(
                 TerminalState::Requested(_) | TerminalState::Exited(_) | TerminalState::Closing,
             )
@@ -319,188 +377,57 @@ impl Channels {
         Ok(())
     }
 
-    pub(crate) fn channels_mut(&mut self) -> &mut BTreeMap<u32, Channel> {
-        &mut self.channels
-    }
-}
-
-pub(crate) struct TerminalsFuture<'a> {
-    channels: &'a mut BTreeMap<u32, Channel>,
-    write: &'a mut WriteState,
-}
-
-impl<'a> TerminalsFuture<'a> {
-    pub(crate) fn new(channels: &'a mut BTreeMap<u32, Channel>, write: &'a mut WriteState) -> Self {
-        Self { channels, write }
-    }
-}
-
-impl<'a> Future for TerminalsFuture<'a> {
-    type Output = Result<(), Error>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let Self { channels, write } = &mut *self;
+    pub(crate) fn poll_io(
+        &mut self,
+        write: &mut WriteState,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Error>> {
         let mut remove = None;
-        'channels: for (&local_id, channel) in channels.iter_mut() {
-            let Some(state) = &mut channel.terminal else {
-                continue;
+        for (&local_id, channel) in &mut self.channels {
+            let confirmation = channel.confirmation(local_id);
+            let progress = match &mut channel.kind {
+                ChannelKind::Session(session) => {
+                    session.poll_io(local_id, &mut channel.flow, write, cx)
+                }
+                ChannelKind::Tcp(tcp) => tcp.poll_io(local_id, confirmation, write, cx),
             };
-
-            let terminal = loop {
-                match state {
-                    TerminalState::Running(terminal) => break terminal,
-                    TerminalState::Requested(_) => continue 'channels,
-                    TerminalState::Exiting { terminal, deadline } => match terminal.poll_wait(cx) {
-                        Poll::Ready(Ok(status)) => {
-                            *state = match status.code() {
-                                Some(code) => TerminalState::Exited(code as u32),
-                                None => TerminalState::Closing,
-                            };
-                        }
-                        Poll::Ready(Err(error)) => {
-                            warn!(%error, "error waiting for shell to exit");
-                            *state = TerminalState::Closing;
-                        }
-                        // No waker is registered for the deadline, so an expired
-                        // grace period is only noticed on the next poll (driven by
-                        // connection traffic).
-                        Poll::Pending if Instant::now() < *deadline => continue 'channels,
-                        Poll::Pending => {
-                            warn!(
-                                channel = local_id,
-                                "shell did not exit after PTY EOF; killing"
-                            );
-                            // Stay in `Exiting`: once the kill takes effect the shell
-                            // becomes reapable and the `Poll::Ready` arms above reap it
-                            // and forward its (signal) status.
-                            terminal.start_kill();
-                            continue 'channels;
-                        }
-                    },
-                    TerminalState::Exited(status) => {
-                        let request = ChannelRequest {
-                            recipient_channel: channel.remote_id,
-                            r#type: ChannelRequestType::ExitStatus(*status),
-                            want_reply: false,
-                        };
-
-                        *state = TerminalState::Closing;
-                        if !channel.close_sent {
-                            write.encode(&request)?;
-                            return Poll::Ready(Ok(()));
-                        }
-                    }
-                    TerminalState::Reaping { terminal, deadline } => match terminal.poll_wait(cx) {
-                        Poll::Ready(result) => {
-                            match result {
-                                Ok(_) => {
-                                    debug!(
-                                        channel = local_id,
-                                        "reaped killed shell; removing channel"
-                                    )
-                                }
-                                Err(error) => {
-                                    warn!(%error, "error reaping killed shell; removing channel")
-                                }
-                            }
-                            remove = Some(local_id);
-                            break 'channels;
-                        }
-                        // See `Exiting`: the deadline has no waker of its own.
-                        Poll::Pending if Instant::now() < *deadline => continue 'channels,
-                        Poll::Pending => {
-                            warn!(
-                                channel = local_id,
-                                "killed shell did not exit; removing channel"
-                            );
-                            remove = Some(local_id);
-                            break 'channels;
-                        }
-                    },
-                    TerminalState::Closing => {
-                        if channel.close_sent {
-                            continue 'channels;
-                        }
-
-                        channel.close_sent = true;
-                        write.encode(&ChannelClose {
-                            recipient_channel: channel.remote_id,
-                        })?;
-                        return Poll::Ready(Ok(()));
-                    }
+            match progress {
+                Poll::Ready(Ok(ChannelProgress::Keep)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(ChannelProgress::Remove)) => {
+                    remove = Some(local_id);
+                    break;
                 }
-            };
-
-            let mut buf = [0u8; 4096];
-            let limit = Ord::min(channel.maximum_packet_size, channel.send_window) as usize;
-            let writable = match limit {
-                0 => continue,
-                _ if limit < buf.len() => &mut buf[..limit],
-                _ => &mut buf,
-            };
-
-            match terminal.poll_read(writable, cx) {
-                // The PTY can report EOF slightly before the shell becomes reapable, so
-                // hold the channel open until the shell has been waited on; its exit
-                // status must reach the client before the channel close. PTY EOF only
-                // means all user fds were closed, not that the shell exited, so bound
-                // the wait with a grace period after which the shell is killed.
-                Poll::Ready(Ok(0)) => {
-                    if let TerminalState::Running(terminal) =
-                        mem::replace(state, TerminalState::Closing)
-                    {
-                        *state = TerminalState::Exiting {
-                            terminal,
-                            deadline: Instant::now() + EXIT_GRACE_PERIOD,
-                        };
-                    }
-
-                    write.encode(&ChannelEof {
-                        recipient_channel: channel.remote_id,
-                    })?;
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Ready(Err(error)) => {
-                    terminal.start_kill();
-                    warn!(%error, "error reading from terminal");
-                    return Poll::Ready(Err(error.into()));
-                }
-                Poll::Ready(Ok(n)) => {
-                    channel.send_window = channel.send_window.saturating_sub(n as u32);
-                    write.encode(&ChannelData {
-                        recipient_channel: channel.remote_id,
-                        data: Cow::Borrowed(&buf[..n]),
-                    })?;
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Pending => continue,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
             }
         }
-
         if let Some(local_id) = remove {
-            channels.remove(&local_id);
+            self.channels.remove(&local_id);
             return Poll::Ready(Ok(()));
         }
-
         Poll::Pending
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct Channel {
+    flow: ChannelFlow,
+    kind: ChannelKind,
+}
+
+#[derive(Debug)]
+struct ChannelFlow {
     remote_id: u32,
     send_window: u32,
     receive_window: u32,
     maximum_packet_size: u32,
-    env: Vec<(String, String)>,
-    terminal: Option<TerminalState>,
     close_sent: bool,
 }
 
 impl Channel {
     fn confirmation(&self, local_id: u32) -> ChannelOpenConfirmation {
         ChannelOpenConfirmation {
-            recipient_channel: self.remote_id,
+            recipient_channel: self.flow.remote_id,
             sender_channel: local_id,
             initial_window_size: 0,
             maximum_packet_size: MAX_PACKET_LEN - 64, // Leave some room for packet overhead
@@ -516,13 +443,18 @@ impl Channel {
         pty_req: &PtyReq<'_>,
         write: &mut WriteState,
     ) -> Result<(), Error> {
-        self.terminal = Some(TerminalState::Running(Terminal::spawn(
-            command, pty_req, &self.env,
+        let ChannelKind::Session(session) = &mut self.kind else {
+            return Err(Error::InvalidState("terminal requested on TCP channel"));
+        };
+        session.terminal = Some(TerminalState::Running(Terminal::spawn(
+            command,
+            pty_req,
+            &session.env,
         )?));
 
-        self.receive_window = INITIAL_WINDOW_SIZE;
+        self.flow.receive_window = INITIAL_WINDOW_SIZE;
         write.encode(&ChannelWindowAdjust {
-            recipient_channel: self.remote_id,
+            recipient_channel: self.flow.remote_id,
             bytes_to_add: INITIAL_WINDOW_SIZE,
         })?;
         Ok(())
@@ -530,13 +462,226 @@ impl Channel {
 
     fn success(&self) -> ChannelRequestSuccess {
         ChannelRequestSuccess {
-            recipient_channel: self.remote_id,
+            recipient_channel: self.flow.remote_id,
         }
     }
 
     fn failure(&self) -> ChannelRequestFailure {
         ChannelRequestFailure {
-            recipient_channel: self.remote_id,
+            recipient_channel: self.flow.remote_id,
+        }
+    }
+}
+
+enum ChannelKind {
+    // The terminal state is substantially larger than the TCP state, so boxing keeps channels
+    // compact.
+    Session(Box<SessionChannel>),
+    Tcp(TcpConnection),
+}
+
+// Close-handshake state will be added alongside TCP EOF and close handling.
+enum TcpConnection {
+    Connecting(Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>),
+    Connected(TcpStream),
+}
+
+impl TcpConnection {
+    fn valid_destination(destination: &DirectTcpip<'_>, maximum_packet_size: u32) -> bool {
+        !destination.host.is_empty()
+            && destination.port <= u16::MAX as u32
+            && destination.originator_port <= u16::MAX as u32
+            && maximum_packet_size != 0
+    }
+
+    fn poll_io(
+        &mut self,
+        local_id: u32,
+        confirmation: ChannelOpenConfirmation,
+        write: &mut WriteState,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ChannelProgress, Error>> {
+        match self {
+            Self::Connecting(future) => match future.as_mut().poll(cx) {
+                Poll::Ready(Ok(stream)) => {
+                    *self = Self::Connected(stream);
+                    write.encode(&confirmation)?;
+                    Poll::Ready(Ok(ChannelProgress::Keep))
+                }
+                Poll::Ready(Err(error)) => {
+                    debug!(channel = local_id, %error, "TCP connection failed");
+                    write.encode(&ChannelOpenFailure::destination_failed(
+                        confirmation.recipient_channel,
+                    ))?;
+                    Poll::Ready(Ok(ChannelProgress::Remove))
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            Self::Connected(stream) => {
+                let _ = stream;
+                todo!()
+                Poll::Pending
+            }
+        }
+    }
+}
+
+enum ChannelProgress {
+    Keep,
+    Remove,
+}
+
+impl fmt::Debug for ChannelKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session(session) => f.debug_tuple("Session").field(session).finish(),
+            Self::Tcp(TcpConnection::Connecting(_)) => f.write_str("Tcp(Connecting)"),
+            Self::Tcp(TcpConnection::Connected(_)) => f.write_str("Tcp(Connected)"),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionChannel {
+    env: Vec<(String, String)>,
+    terminal: Option<TerminalState>,
+}
+
+impl SessionChannel {
+    fn poll_io(
+        &mut self,
+        local_id: u32,
+        flow: &mut ChannelFlow,
+        write: &mut WriteState,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ChannelProgress, Error>> {
+        let Some(state) = &mut self.terminal else {
+            return Poll::Pending;
+        };
+
+        let terminal = loop {
+            match state {
+                TerminalState::Running(terminal) => break terminal,
+                TerminalState::Requested(_) => return Poll::Pending,
+                TerminalState::Exiting { terminal, deadline } => match terminal.poll_wait(cx) {
+                    Poll::Ready(Ok(status)) => {
+                        *state = match status.code() {
+                            Some(code) => TerminalState::Exited(code as u32),
+                            None => TerminalState::Closing,
+                        };
+                    }
+                    Poll::Ready(Err(error)) => {
+                        warn!(%error, "error waiting for shell to exit");
+                        *state = TerminalState::Closing;
+                    }
+                    // No waker is registered for the deadline, so an expired
+                    // grace period is only noticed on the next poll (driven by
+                    // connection traffic).
+                    Poll::Pending if Instant::now() < *deadline => return Poll::Pending,
+                    Poll::Pending => {
+                        warn!(
+                            channel = local_id,
+                            "shell did not exit after PTY EOF; killing"
+                        );
+                        // Stay in `Exiting`: once the kill takes effect the shell
+                        // becomes reapable and the `Poll::Ready` arms above reap it
+                        // and forward its (signal) status.
+                        terminal.start_kill();
+                        return Poll::Pending;
+                    }
+                },
+                TerminalState::Exited(status) => {
+                    let request = ChannelRequest {
+                        recipient_channel: flow.remote_id,
+                        r#type: ChannelRequestType::ExitStatus(*status),
+                        want_reply: false,
+                    };
+
+                    *state = TerminalState::Closing;
+                    if !flow.close_sent {
+                        write.encode(&request)?;
+                        return Poll::Ready(Ok(ChannelProgress::Keep));
+                    }
+                }
+                TerminalState::Reaping { terminal, deadline } => match terminal.poll_wait(cx) {
+                    Poll::Ready(result) => {
+                        match result {
+                            Ok(_) => {
+                                debug!(channel = local_id, "reaped killed shell; removing channel")
+                            }
+                            Err(error) => {
+                                warn!(%error, "error reaping killed shell; removing channel")
+                            }
+                        }
+                        return Poll::Ready(Ok(ChannelProgress::Remove));
+                    }
+                    // See `Exiting`: the deadline has no waker of its own.
+                    Poll::Pending if Instant::now() < *deadline => return Poll::Pending,
+                    Poll::Pending => {
+                        warn!(
+                            channel = local_id,
+                            "killed shell did not exit; removing channel"
+                        );
+                        return Poll::Ready(Ok(ChannelProgress::Remove));
+                    }
+                },
+                TerminalState::Closing => {
+                    if flow.close_sent {
+                        return Poll::Pending;
+                    }
+
+                    flow.close_sent = true;
+                    write.encode(&ChannelClose {
+                        recipient_channel: flow.remote_id,
+                    })?;
+                    return Poll::Ready(Ok(ChannelProgress::Keep));
+                }
+            }
+        };
+
+        let mut buf = [0u8; 4096];
+        let limit = Ord::min(flow.maximum_packet_size, flow.send_window) as usize;
+        let writable = match limit {
+            0 => return Poll::Pending,
+            _ if limit < buf.len() => &mut buf[..limit],
+            _ => &mut buf,
+        };
+
+        match terminal.poll_read(writable, cx) {
+            // The PTY can report EOF slightly before the shell becomes reapable, so
+            // hold the channel open until the shell has been waited on; its exit
+            // status must reach the client before the channel close. PTY EOF only
+            // means all user fds were closed, not that the shell exited, so bound
+            // the wait with a grace period after which the shell is killed.
+            Poll::Ready(Ok(0)) => {
+                if let TerminalState::Running(terminal) =
+                    mem::replace(state, TerminalState::Closing)
+                {
+                    *state = TerminalState::Exiting {
+                        terminal,
+                        deadline: Instant::now() + EXIT_GRACE_PERIOD,
+                    };
+                }
+
+                write.encode(&ChannelEof {
+                    recipient_channel: flow.remote_id,
+                })?;
+                Poll::Ready(Ok(ChannelProgress::Keep))
+            }
+            Poll::Ready(Err(error)) => {
+                terminal.start_kill();
+                warn!(%error, "error reading from terminal");
+                Poll::Ready(Err(error.into()))
+            }
+            Poll::Ready(Ok(n)) => {
+                flow.send_window = flow.send_window.saturating_sub(n as u32);
+                write.encode(&ChannelData {
+                    recipient_channel: flow.remote_id,
+                    data: Cow::Borrowed(&buf[..n]),
+                })?;
+                Poll::Ready(Ok(ChannelProgress::Keep))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -626,6 +771,8 @@ impl<'a> TryFrom<IncomingPacket<'a>> for IncomingChannelMessage<'a> {
     }
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 const INITIAL_WINDOW_SIZE: u32 = 16 * MAX_PACKET_LEN;
 /// How long to wait for a shell to become reapable after its PTY reports EOF
 /// or after it is killed
@@ -643,3 +790,133 @@ const MAX_ENV_VARIABLE_VALUE_LEN: usize = 16 * 1024;
 
 /// Maximum number of open channels per session
 const MAX_OPEN_CHANNELS_PER_SESSION: usize = 256;
+
+#[cfg(test)]
+mod tests {
+    use proto::channels::{ChannelOpenType, DirectTcpip};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_tcp_open_does_not_reserve_a_channel() {
+        let mut channels = Channels::default();
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        for (host, port, originator_port, maximum_packet_size) in [
+            ("", 22, 1, 32768),
+            ("localhost", 65536, 1, 32768),
+            ("localhost", 22, 65536, 32768),
+            ("localhost", 22, 1, 0),
+        ] {
+            let start = write.buffered().len();
+            channels
+                .open(
+                    ChannelOpen {
+                        r#type: ChannelOpenType::DirectTcpip(DirectTcpip {
+                            host,
+                            port,
+                            originator_address: "127.0.0.1",
+                            originator_port,
+                        }),
+                        sender_channel: 7,
+                        initial_window_size: 0,
+                        maximum_packet_size,
+                    },
+                    &mut write,
+                )
+                .unwrap();
+            assert!(channels.channels.is_empty());
+            let packet = &write.buffered()[start..];
+            assert_eq!(packet[5], u8::from(MessageType::ChannelOpenFailure));
+            assert_eq!(&packet[10..14], &1u32.to_be_bytes());
+        }
+        assert!(!write.buffered().is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_sender_does_not_reserve_second_channel() {
+        let mut channels = Channels::default();
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        channels
+            .open(
+                ChannelOpen {
+                    r#type: ChannelOpenType::Session,
+                    sender_channel: 7,
+                    initial_window_size: 0,
+                    maximum_packet_size: 32768,
+                },
+                &mut write,
+            )
+            .unwrap();
+        channels
+            .open(
+                ChannelOpen {
+                    r#type: ChannelOpenType::DirectTcpip(DirectTcpip {
+                        host: "127.0.0.1",
+                        port: 22,
+                        originator_address: "127.0.0.1",
+                        originator_port: 0,
+                    }),
+                    sender_channel: 7,
+                    initial_window_size: 0,
+                    maximum_packet_size: 32768,
+                },
+                &mut write,
+            )
+            .unwrap();
+        assert_eq!(channels.channels.len(), 1);
+        assert!(matches!(
+            channels.channels.get(&0).unwrap().kind,
+            ChannelKind::Session(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_tcp_connect_keeps_session_available_and_releases_slot_on_timeout() {
+        let mut channels = Channels::default();
+        let future = Box::pin(async {
+            tokio::time::timeout(Duration::from_millis(20), core::future::pending())
+                .await
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))
+        });
+        channels.channels.insert(
+            0,
+            Channel {
+                flow: ChannelFlow {
+                    remote_id: 1,
+                    send_window: 0,
+                    receive_window: 0,
+                    maximum_packet_size: 32768,
+                    close_sent: false,
+                },
+                kind: ChannelKind::Tcp(TcpConnection::Connecting(future)),
+            },
+        );
+        channels.next_id = 1;
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        assert!(
+            core::future::poll_fn(|cx| Poll::Ready(channels.poll_io(&mut write, cx)))
+                .await
+                .is_pending()
+        );
+        assert!(write.buffered().is_empty());
+
+        channels
+            .open(
+                ChannelOpen {
+                    r#type: ChannelOpenType::Session,
+                    sender_channel: 2,
+                    initial_window_size: 0,
+                    maximum_packet_size: 32768,
+                },
+                &mut write,
+            )
+            .unwrap();
+        let before = write.buffered().len();
+        core::future::poll_fn(|cx| channels.poll_io(&mut write, cx))
+            .await
+            .unwrap();
+        assert!(write.buffered().len() > before);
+        assert!(!channels.channels.contains_key(&0));
+        assert!(channels.channels.contains_key(&1));
+    }
+}

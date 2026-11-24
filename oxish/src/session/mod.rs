@@ -18,7 +18,7 @@ use crate::{Connection, Error, receive};
 
 mod connections;
 pub(crate) use connections::Channels;
-use connections::{IncomingChannelMessage, TerminalsFuture};
+use connections::IncomingChannelMessage;
 
 /// A single SSH session's state
 ///
@@ -127,7 +127,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
 
                     self.conn.flush().await?;
                 }
-                result = TerminalsFuture::new(self.channels.channels_mut(), &mut self.conn.write), if !self.kx.in_progress() => {
+            // TODO: this is a little complex expr
+                result = core::future::poll_fn(|cx| self.channels.poll_io(&mut self.conn.write, cx)), if !self.kx.in_progress() => {
                     result?;
                     self.conn.flush().await?;
                 }

@@ -3,7 +3,9 @@ use std::{borrow::Cow, collections::BTreeMap};
 
 use tracing::warn;
 
-use crate::{Decode, Decoded, Encode, IncomingPacket, MessageType, ProtoError, named::ChannelType};
+use crate::{
+    Decode, Decoded, Encode, IncomingPacket, MessageType, ProtoError, named::ChannelTypeName,
+};
 
 /// The `SSH_MSG_CHANNEL_OPEN` message
 ///
@@ -11,7 +13,7 @@ use crate::{Decode, Decoded, Encode, IncomingPacket, MessageType, ProtoError, na
 #[derive(Debug)]
 pub struct ChannelOpen<'a> {
     /// The channel type to open
-    pub r#type: ChannelType<'a>,
+    pub r#type: ChannelOpenType<'a>,
     /// The sender's identifier for the channel
     pub sender_channel: u32,
     /// Initial number of bytes the sender is willing to receive
@@ -26,10 +28,7 @@ impl<'a> TryFrom<IncomingPacket<'a>> for ChannelOpen<'a> {
     fn try_from(packet: IncomingPacket<'a>) -> Result<Self, Self::Error> {
         packet.expect(&[MessageType::ChannelOpen])?;
 
-        let Decoded {
-            value: r#type,
-            next,
-        } = ChannelType::decode(packet.payload)?;
+        let Decoded { value: name, next } = ChannelTypeName::decode(packet.payload)?;
 
         let Decoded {
             value: sender_channel,
@@ -46,24 +45,89 @@ impl<'a> TryFrom<IncomingPacket<'a>> for ChannelOpen<'a> {
             next,
         } = u32::decode(next)?;
 
-        match r#type {
-            ChannelType::Session => match next.is_empty() {
-                true => {}
-                false => {
-                    return Err(ProtoError::InvalidPacket(
-                        "extra data in channel open packet",
-                    ));
-                }
-            },
-            ChannelType::Unknown(_) => {}
-        }
+        let r#type = match name {
+            ChannelTypeName::Session if next.is_empty() => ChannelOpenType::Session,
+            ChannelTypeName::Session => {
+                return Err(ProtoError::InvalidPacket(
+                    "extra data in channel open packet",
+                ));
+            }
+            ChannelTypeName::DirectTcpip => {
+                ChannelOpenType::DirectTcpip(DirectTcpip::decode(next)?)
+            }
+            ChannelTypeName::Unknown(name) => ChannelOpenType::Unknown(name),
+        };
 
-        Ok(ChannelOpen {
+        Ok(Self {
             r#type,
             sender_channel,
             initial_window_size,
             maximum_packet_size,
         })
+    }
+}
+
+#[doc = "The channel type and its type-specific fields in a [`ChannelOpen`]."]
+#[non_exhaustive]
+#[derive(Debug, Eq, PartialEq)]
+pub enum ChannelOpenType<'a> {
+    #[doc = "A `session` channel."]
+    Session,
+    #[doc = "A `direct-tcpip` channel opened for local TCP forwarding."]
+    DirectTcpip(DirectTcpip<'a>),
+    #[doc = "An unrecognized channel type, identified by its wire name."]
+    Unknown(&'a str),
+}
+
+#[doc = "The type-specific fields of an RFC 4254 `direct-tcpip` channel open."]
+#[derive(Debug, Eq, PartialEq)]
+pub struct DirectTcpip<'a> {
+    #[doc = "The destination host as seen from the SSH server."]
+    pub host: &'a str,
+    #[doc = "The destination port as a wire value."]
+    pub port: u32,
+    #[doc = "The originator address reported by the SSH client."]
+    pub originator_address: &'a str,
+    #[doc = "The originator port reported by the SSH client as a wire value."]
+    pub originator_port: u32,
+}
+
+impl<'a> DirectTcpip<'a> {
+    fn decode(bytes: &'a [u8]) -> Result<Self, ProtoError> {
+        let Decoded { value: host, next } = Self::decode_address(bytes)?;
+        let Decoded { value: port, next } = u32::decode(next)?;
+        let Decoded {
+            value: originator_address,
+            next,
+        } = Self::decode_address(next)?;
+        let Decoded {
+            value: originator_port,
+            next,
+        } = u32::decode(next)?;
+        if !next.is_empty() {
+            return Err(ProtoError::InvalidPacket(
+                "extra data in direct-tcpip channel open",
+            ));
+        }
+
+        Ok(Self {
+            host,
+            port,
+            originator_address,
+            originator_port,
+        })
+    }
+
+    fn decode_address(bytes: &'a [u8]) -> Result<Decoded<'a, &'a str>, ProtoError> {
+        let Decoded { value, next } = <&[u8]>::decode(bytes)?;
+        let value = str::from_utf8(value)
+            .map_err(|_| ProtoError::InvalidPacket("invalid UTF-8 in direct-tcpip address"))?;
+        // Length-prefixed SSH strings can carry NUL even in valid UTF-8.
+        // A C resolver treats that byte as the end of the name.
+        if value.as_bytes().contains(&0) {
+            return Err(ProtoError::InvalidPacket("NUL in direct-tcpip address"));
+        }
+        Ok(Decoded { value, next })
     }
 }
 
@@ -107,6 +171,35 @@ pub struct ChannelOpenFailure<'a> {
     recipient_channel: u32,
     reason_code: ChannelOpenFailureReason,
     description: &'a str,
+}
+
+impl<'a> ChannelOpenFailure<'a> {
+    #[doc = "Failure response when a channel open is administratively prohibited."]
+    pub fn administratively_prohibited(recipient_channel: u32, description: &'a str) -> Self {
+        Self {
+            recipient_channel,
+            reason_code: ChannelOpenFailureReason::AdministrativelyProhibited,
+            description,
+        }
+    }
+
+    #[doc = "Failure response when a destination connection fails."]
+    pub fn destination_failed(recipient_channel: u32) -> Self {
+        Self {
+            recipient_channel,
+            reason_code: ChannelOpenFailureReason::ConnectFailed,
+            description: "connection failed",
+        }
+    }
+
+    #[doc = "Failure response when no channel slot is available."]
+    pub fn resource_shortage(recipient_channel: u32) -> Self {
+        Self {
+            recipient_channel,
+            reason_code: ChannelOpenFailureReason::ResourceShortage,
+            description: "too many open channels",
+        }
+    }
 }
 
 impl ChannelOpenFailure<'static> {
@@ -154,7 +247,6 @@ impl Encode for ChannelOpenFailure<'_> {
     }
 }
 
-#[expect(dead_code)]
 #[repr(u32)]
 #[derive(Clone, Copy, Debug)]
 enum ChannelOpenFailureReason {

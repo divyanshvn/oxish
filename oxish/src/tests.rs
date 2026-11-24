@@ -23,7 +23,11 @@ use proto::{
 };
 use tempfile::TempDir;
 use tokio::{
-    io::AsyncWriteExt, net::TcpListener, process::Command, sync::OnceCell, task::JoinHandle,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
+    process::Command,
+    sync::OnceCell,
+    task::JoinHandle,
     time::timeout,
 };
 use zeroize::Zeroizing;
@@ -306,6 +310,66 @@ async fn force_command_exec() {
         "forced command did not see the client's command.\n\
         --- stdout ---\n{stdout}",
     );
+}
+
+#[tokio::test]
+async fn direct_tcpip_connects_before_confirmation() -> anyhow::Result<()> {
+    let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let (_key_dir, mut client, server) = setup(
+        &PublicKeyAlgorithm::Ed25519,
+        None,
+        None,
+        crate::DEFAULT_PROVIDER,
+    )
+    .await?;
+
+    client
+        .cmd
+        .arg("-T")
+        .arg("-W")
+        .arg(target.local_addr()?.to_string());
+    let mut child = client
+        .cmd
+        .arg(format!("{USER}@{}", client.addr.ip()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let (_stream, _) = timeout(Duration::from_secs(10), target.accept()).await??;
+    let stderr = child.stderr.take().context("missing SSH stderr")?;
+    let mut lines = BufReader::new(stderr).lines();
+    timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await? {
+            if line.contains("open confirm") {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("SSH exited without channel confirmation")
+    })
+    .await??;
+    child.kill().await?;
+    let _ = timeout(Duration::from_secs(10), server).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_tcpip_connection_refused() -> anyhow::Result<()> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
+    let destination = socket.local_addr()?;
+    let (_key_dir, mut client, server) = setup(
+        &PublicKeyAlgorithm::Ed25519,
+        None,
+        None,
+        crate::DEFAULT_PROVIDER,
+    )
+    .await?;
+    client.cmd.arg("-T").arg("-W").arg(destination.to_string());
+    let (status, _, stderr) = client.run(&[], Duration::from_secs(10), server).await?;
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains("connect failed"), "{stderr}");
+    Ok(())
 }
 
 /// Exercise a client-initiated rekey against the graviola provider
