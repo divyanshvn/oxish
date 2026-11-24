@@ -127,7 +127,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
 
                     self.conn.flush().await?;
                 }
-            // TODO: this is a little complex expr
+            // TODO: Can we simplify this expression
                 result = core::future::poll_fn(|cx| self.channels.poll_io(&mut self.conn.write, cx)), if !self.kx.in_progress() => {
                     result?;
                     self.conn.flush().await?;

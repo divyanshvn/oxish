@@ -153,6 +153,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         Ok((exchange, identities))
     }
 
+    // TODO: fun exercise: how can i replace this direct polling with simpler code and will it affect performance.
     async fn flush(&mut self) -> Result<(), Error> {
         future::poll_fn(|cx| {
             while !self.write.buffered().is_empty() {

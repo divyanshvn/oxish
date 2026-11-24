@@ -23,7 +23,7 @@ use proto::{
 };
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     process::Command,
     sync::OnceCell,
@@ -348,6 +348,44 @@ async fn direct_tcpip_connects_before_confirmation() -> anyhow::Result<()> {
         anyhow::bail!("SSH exited without channel confirmation")
     })
     .await??;
+    child.kill().await?;
+    let _ = timeout(Duration::from_secs(10), server).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_tcpip_sends_data_to_destination() -> anyhow::Result<()> {
+    let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let (_key_dir, mut client, server) = setup(
+        &PublicKeyAlgorithm::Ed25519,
+        None,
+        None,
+        crate::DEFAULT_PROVIDER,
+    )
+    .await?;
+    client
+        .cmd
+        .arg("-T")
+        .arg("-W")
+        .arg(target.local_addr()?.to_string());
+    let mut child = client
+        .cmd
+        .arg(format!("{USER}@{}", client.addr.ip()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().context("missing SSH stdin")?;
+    let payload = b"forwarded TCP data\0".repeat(10_000);
+    let mut received = vec![0; payload.len()];
+    timeout(Duration::from_secs(15), async {
+        let (mut stream, _) = target.accept().await?;
+        tokio::try_join!(stdin.write_all(&payload), stream.read_exact(&mut received))?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    assert_eq!(received, payload);
     child.kill().await?;
     let _ = timeout(Duration::from_secs(10), server).await?;
     Ok(())

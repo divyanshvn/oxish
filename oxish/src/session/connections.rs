@@ -9,7 +9,7 @@ use core::{
 };
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, VecDeque, btree_map::Entry},
     io,
     time::Instant,
 };
@@ -23,7 +23,7 @@ use proto::{
         ChannelRequestSuccess, ChannelRequestType, ChannelWindowAdjust, DirectTcpip, PtyReq,
     },
 };
-use tokio::net::TcpStream;
+use tokio::{io::AsyncWrite, net::TcpStream};
 use tracing::{debug, info, warn};
 
 use crate::{Error, platform::Terminal};
@@ -272,10 +272,33 @@ impl Channels {
             ));
         };
 
+        if let ChannelKind::Tcp(tcp) = &mut channel.kind {
+            if channel.flow.close_sent {
+                return Ok(None);
+            }
+            let TcpConnection::Connected(forward) = tcp else {
+                return Err(ProtoError::InvalidPacket("TCP channel is not open"));
+            };
+            if data.data.len() > (MAX_PACKET_LEN - 64) as usize {
+                return Err(ProtoError::InvalidPacket(
+                    "channel data exceeds maximum packet size",
+                ));
+            }
+            let Some(window) = channel
+                .flow
+                .receive_window
+                .checked_sub(data.data.len() as u32)
+            else {
+                return Err(ProtoError::InvalidPacket(
+                    "channel data exceeds receive window",
+                ));
+            };
+            forward.pending.extend(data.data.iter().copied());
+            channel.flow.receive_window = window;
+            return Ok(None);
+        }
         let ChannelKind::Session(session) = &mut channel.kind else {
-            return Err(ProtoError::InvalidPacket(
-                "TCP relay is not yet implemented",
-            ));
+            return Err(ProtoError::InvalidPacket("invalid channel type"));
         };
 
         match channel
@@ -384,12 +407,14 @@ impl Channels {
     ) -> Poll<Result<(), Error>> {
         let mut remove = None;
         for (&local_id, channel) in &mut self.channels {
-            let confirmation = channel.confirmation(local_id);
+            let mut confirmation = channel.confirmation(local_id);
             let progress = match &mut channel.kind {
                 ChannelKind::Session(session) => {
                     session.poll_io(local_id, &mut channel.flow, write, cx)
                 }
-                ChannelKind::Tcp(tcp) => tcp.poll_io(local_id, confirmation, write, cx),
+                ChannelKind::Tcp(tcp) => {
+                    tcp.poll_io(local_id, &mut confirmation, &mut channel.flow, write, cx)
+                }
             };
             match progress {
                 Poll::Ready(Ok(ChannelProgress::Keep)) => return Poll::Ready(Ok(())),
@@ -474,8 +499,7 @@ impl Channel {
 }
 
 enum ChannelKind {
-    // The terminal state is substantially larger than the TCP state, so boxing keeps channels
-    // compact.
+    // 11/24/2026 10:50 PM IST - TODO: Need to make sure Box is the right choice here. Agent says the reason being to make it compact, which does not make sense to me.
     Session(Box<SessionChannel>),
     Tcp(TcpConnection),
 }
@@ -483,7 +507,8 @@ enum ChannelKind {
 // Close-handshake state will be added alongside TCP EOF and close handling.
 enum TcpConnection {
     Connecting(Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>),
-    Connected(TcpStream),
+    Connected(TcpForward<TcpStream>),
+    Closed,
 }
 
 impl TcpConnection {
@@ -497,15 +522,21 @@ impl TcpConnection {
     fn poll_io(
         &mut self,
         local_id: u32,
-        confirmation: ChannelOpenConfirmation,
+        confirmation: &mut ChannelOpenConfirmation,
+        flow: &mut ChannelFlow,
         write: &mut WriteState,
         cx: &mut Context<'_>,
     ) -> Poll<Result<ChannelProgress, Error>> {
         match self {
             Self::Connecting(future) => match future.as_mut().poll(cx) {
                 Poll::Ready(Ok(stream)) => {
-                    *self = Self::Connected(stream);
-                    write.encode(&confirmation)?;
+                    *self = Self::Connected(TcpForward {
+                        stream,
+                        pending: VecDeque::new(),
+                    });
+                    flow.receive_window = TCP_RECEIVE_WINDOW;
+                    confirmation.initial_window_size = TCP_RECEIVE_WINDOW;
+                    write.encode(confirmation)?;
                     Poll::Ready(Ok(ChannelProgress::Keep))
                 }
                 Poll::Ready(Err(error)) => {
@@ -517,10 +548,57 @@ impl TcpConnection {
                 }
                 Poll::Pending => Poll::Pending,
             },
-            Self::Connected(stream) => {
-                let _ = stream;
-                todo!()
-                Poll::Pending
+            Self::Connected(forward) => match forward.poll_write(flow, write, cx) {
+                Poll::Ready(Err(Error::Io(error))) => {
+                    debug!(channel = local_id, %error, "TCP socket write failed");
+                    *self = Self::Closed;
+                    flow.close_sent = true;
+                    write.encode(&ChannelClose {
+                        recipient_channel: flow.remote_id,
+                    })?;
+                    Poll::Ready(Ok(ChannelProgress::Keep))
+                }
+                result => result,
+            },
+            Self::Closed => Poll::Pending,
+            // TODO: maybe better to error out when it's closed but data is received.
+        }
+    }
+}
+
+struct TcpForward<T> {
+    stream: T,
+    pending: VecDeque<u8>,
+}
+
+impl<T: AsyncWrite + Unpin> TcpForward<T> {
+    fn poll_write(
+        &mut self,
+        flow: &mut ChannelFlow,
+        write: &mut WriteState,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ChannelProgress, Error>> {
+        if self.pending.is_empty() {
+            return Poll::Pending;
+        }
+
+        let (bytes, _) = self.pending.as_slices();
+        let bytes = &bytes[..bytes.len().min(4096)];
+        match Pin::new(&mut self.stream).poll_write(cx, bytes) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(0)) => {
+                Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero).into()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
+            Poll::Ready(Ok(count)) => {
+                self.pending.drain(..count);
+                let count = count as u32;
+                flow.receive_window += count;
+                write.encode(&ChannelWindowAdjust {
+                    recipient_channel: flow.remote_id,
+                    bytes_to_add: count,
+                })?;
+                Poll::Ready(Ok(ChannelProgress::Keep))
             }
         }
     }
@@ -537,6 +615,7 @@ impl fmt::Debug for ChannelKind {
             Self::Session(session) => f.debug_tuple("Session").field(session).finish(),
             Self::Tcp(TcpConnection::Connecting(_)) => f.write_str("Tcp(Connecting)"),
             Self::Tcp(TcpConnection::Connected(_)) => f.write_str("Tcp(Connected)"),
+            Self::Tcp(TcpConnection::Closed) => f.write_str("Tcp(Closed)"),
         }
     }
 }
@@ -772,6 +851,7 @@ impl<'a> TryFrom<IncomingPacket<'a>> for IncomingChannelMessage<'a> {
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_RECEIVE_WINDOW: u32 = 64 * 1024;
 
 const INITIAL_WINDOW_SIZE: u32 = 16 * MAX_PACKET_LEN;
 /// How long to wait for a shell to become reapable after its PTY reports EOF
@@ -794,8 +874,168 @@ const MAX_OPEN_CHANNELS_PER_SESSION: usize = 256;
 #[cfg(test)]
 mod tests {
     use proto::channels::{ChannelOpenType, DirectTcpip};
+    use tokio::io::AsyncReadExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn tcp_write_is_limited_to_four_kib_per_poll() {
+        let (socket, _peer) = tokio::io::duplex(8192);
+        let mut forward = TcpForward {
+            stream: socket,
+            pending: VecDeque::from(vec![7; 6000]),
+        };
+        let mut flow = ChannelFlow {
+            remote_id: 1,
+            send_window: 0,
+            receive_window: TCP_RECEIVE_WINDOW - 6000,
+            maximum_packet_size: 32768,
+            close_sent: false,
+        };
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        core::future::poll_fn(|cx| forward.poll_write(&mut flow, &mut write, cx))
+            .await
+            .unwrap();
+        assert_eq!(forward.pending.len(), 6000 - 4096);
+        assert_eq!(flow.receive_window, TCP_RECEIVE_WINDOW - 6000 + 4096);
+        assert_eq!(&write.buffered()[10..14], &4096u32.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn tcp_write_preserves_partial_data_and_credits_only_written_bytes() {
+        let (socket, mut peer) = tokio::io::duplex(3);
+        let mut forward = TcpForward {
+            stream: socket,
+            pending: VecDeque::from(b"abcdefgh".to_vec()),
+        };
+        let mut flow = ChannelFlow {
+            remote_id: 42,
+            send_window: 0,
+            receive_window: TCP_RECEIVE_WINDOW - 8,
+            maximum_packet_size: 32768,
+            close_sent: false,
+        };
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        core::future::poll_fn(|cx| forward.poll_write(&mut flow, &mut write, cx))
+            .await
+            .unwrap();
+        assert_eq!(
+            forward.pending.iter().copied().collect::<Vec<_>>(),
+            b"defgh"
+        );
+        assert_eq!(flow.receive_window, TCP_RECEIVE_WINDOW - 5);
+        assert_eq!(
+            write.buffered()[5],
+            u8::from(MessageType::ChannelWindowAdjust)
+        );
+        assert_eq!(&write.buffered()[6..10], &42u32.to_be_bytes());
+        assert_eq!(&write.buffered()[10..14], &3u32.to_be_bytes());
+        let previous_size = write.buffered().len();
+        assert!(
+            core::future::poll_fn(|cx| Poll::Ready(forward.poll_write(&mut flow, &mut write, cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(write.buffered().len(), previous_size);
+        assert_eq!(flow.receive_window, TCP_RECEIVE_WINDOW - 5);
+
+        let mut received = [0; 8];
+        peer.read_exact(&mut received[..3]).await.unwrap();
+        core::future::poll_fn(|cx| forward.poll_write(&mut flow, &mut write, cx))
+            .await
+            .unwrap();
+        assert_eq!(
+            &write.buffered()[previous_size + 10..previous_size + 14],
+            &3u32.to_be_bytes()
+        );
+        peer.read_exact(&mut received[3..6]).await.unwrap();
+        let previous_size = write.buffered().len();
+        core::future::poll_fn(|cx| forward.poll_write(&mut flow, &mut write, cx))
+            .await
+            .unwrap();
+        assert_eq!(
+            &write.buffered()[previous_size + 10..previous_size + 14],
+            &2u32.to_be_bytes()
+        );
+        peer.read_exact(&mut received[6..]).await.unwrap();
+        assert_eq!(&received, b"abcdefgh");
+        assert!(forward.pending.is_empty());
+        assert_eq!(flow.receive_window, TCP_RECEIVE_WINDOW);
+    }
+
+    #[tokio::test]
+    async fn tcp_data_in_flight_after_close_is_ignored() {
+        let mut channels = Channels::default();
+        channels.channels.insert(
+            0,
+            Channel {
+                flow: ChannelFlow {
+                    remote_id: 1,
+                    send_window: 0,
+                    receive_window: 3,
+                    maximum_packet_size: 32768,
+                    close_sent: true,
+                },
+                kind: ChannelKind::Tcp(TcpConnection::Closed),
+            },
+        );
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        let data = ChannelData {
+            recipient_channel: 0,
+            data: Cow::Borrowed(b"abc"),
+        };
+        assert!(channels.data(&data, &mut write).unwrap().is_none());
+        assert!(write.buffered().is_empty());
+        assert_eq!(channels.channels.get(&0).unwrap().flow.receive_window, 3);
+    }
+
+    #[tokio::test]
+    async fn tcp_data_rejects_oversized_packet_and_exhausted_window() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let mut channels = Channels::default();
+        channels.channels.insert(
+            0,
+            Channel {
+                flow: ChannelFlow {
+                    remote_id: 1,
+                    send_window: 0,
+                    receive_window: 3,
+                    maximum_packet_size: 32768,
+                    close_sent: false,
+                },
+                kind: ChannelKind::Tcp(TcpConnection::Connected(TcpForward {
+                    stream,
+                    pending: VecDeque::new(),
+                })),
+            },
+        );
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        for data in [vec![0; 4], vec![0; (MAX_PACKET_LEN - 64 + 1) as usize]] {
+            assert!(
+                channels
+                    .data(
+                        &ChannelData {
+                            recipient_channel: 0,
+                            data: Cow::Owned(data),
+                        },
+                        &mut write
+                    )
+                    .is_err()
+            );
+        }
+        let channel = channels.channels.get(&0).unwrap();
+        assert_eq!(channel.flow.receive_window, 3);
+        assert!(
+            matches!(&channel.kind, ChannelKind::Tcp(TcpConnection::Connected(forward)) if forward.pending.is_empty())
+        );
+        assert!(write.buffered().is_empty());
+    }
 
     #[tokio::test]
     async fn invalid_tcp_open_does_not_reserve_a_channel() {
