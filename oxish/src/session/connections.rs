@@ -429,6 +429,11 @@ impl Channels {
         write: &mut WriteState,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Error>> {
+        // NOTE: Terminal and TCP channels share this ascending local-ID scan.
+        // Each poll stops at the first channel that makes progress. The 32 KiB
+        // TCP read and 4 KiB write budgets bound a visit, but a continuously ready
+        // lower-ID channel can still starve higher IDs. Fair scheduling would
+        // resume after the last channel that made progress and wrap at the end.
         let mut remove = None;
         for (&local_id, channel) in &mut self.channels {
             let mut confirmation = channel.confirmation(local_id);
