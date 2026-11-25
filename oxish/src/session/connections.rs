@@ -23,7 +23,10 @@ use proto::{
         ChannelRequestSuccess, ChannelRequestType, ChannelWindowAdjust, DirectTcpip, PtyReq,
     },
 };
-use tokio::{io::AsyncWrite, net::TcpStream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+};
 use tracing::{debug, info, warn};
 
 use crate::{Error, platform::Terminal};
@@ -98,7 +101,6 @@ impl Channels {
             kind,
         });
 
-        // TODO: why only confirmation for Session?
         if matches!(channel.kind, ChannelKind::Session(_)) {
             write.encode(&channel.confirmation(local_id))?;
         }
@@ -117,7 +119,11 @@ impl Channels {
         };
 
         let ChannelKind::Session(session) = &mut channel.kind else {
-            if request.want_reply {
+            let client_close = matches!(
+                &channel.kind,
+                ChannelKind::Tcp(TcpConnection::Connected(forward)) if forward.client_close
+            );
+            if request.want_reply && !channel.flow.close_sent && !client_close {
                 write.encode(&channel.failure())?;
             }
             return Ok(());
@@ -279,6 +285,12 @@ impl Channels {
             let TcpConnection::Connected(forward) = tcp else {
                 return Err(ProtoError::InvalidPacket("TCP channel is not open"));
             };
+            if forward.client_close {
+                return Ok(None);
+            }
+            if forward.write_state != TcpWriteState::Open {
+                return Err(ProtoError::InvalidPacket("channel data after EOF"));
+            }
             if data.data.len() > (MAX_PACKET_LEN - 64) as usize {
                 return Err(ProtoError::InvalidPacket(
                     "channel data exceeds maximum packet size",
@@ -332,11 +344,23 @@ impl Channels {
     }
 
     pub(crate) fn eof(&mut self, eof: &ChannelEof) -> Result<(), ProtoError> {
-        let Some(_) = self.channels.get_mut(&eof.recipient_channel) else {
+        let Some(channel) = self.channels.get_mut(&eof.recipient_channel) else {
             return Err(ProtoError::InvalidPacket(
                 "channel eof for unknown channel ID",
             ));
         };
+
+        match &mut channel.kind {
+            ChannelKind::Tcp(TcpConnection::Connecting(_)) => {
+                return Err(ProtoError::InvalidPacket("channel EOF before confirmation"));
+            }
+            ChannelKind::Tcp(TcpConnection::Connected(forward))
+                if forward.write_state == TcpWriteState::Open =>
+            {
+                forward.write_state = TcpWriteState::Draining;
+            }
+            _ => {}
+        }
 
         debug!(channel_id = %eof.recipient_channel, "received channel eof from client");
         Ok(())
@@ -352,20 +376,20 @@ impl Channels {
             return Ok(());
         };
 
-        if matches!(channel.kind, ChannelKind::Tcp(TcpConnection::Connecting(_))) {
-            return Err(ProtoError::InvalidPacket("channel close before confirmation").into());
+        if let ChannelKind::Tcp(tcp) = &mut channel.kind {
+            if matches!(
+                tcp.receive_close(&mut channel.flow, write)?,
+                ChannelProgress::Remove
+            ) {
+                self.channels.remove(&close.recipient_channel);
+            }
+            return Ok(());
         }
 
         // Reply with our own close if we haven't sent one already.
-        if !channel.flow.close_sent {
-            channel.flow.close_sent = true;
-            write.encode(&ChannelClose {
-                recipient_channel: channel.flow.remote_id,
-            })?;
-        }
+        channel.flow.send_close(write)?;
 
         let ChannelKind::Session(session) = &mut channel.kind else {
-            self.channels.remove(&close.recipient_channel);
             return Ok(());
         };
 
@@ -449,6 +473,18 @@ struct ChannelFlow {
     close_sent: bool,
 }
 
+impl ChannelFlow {
+    fn send_close(&mut self, write: &mut WriteState) -> Result<(), ProtoError> {
+        if !self.close_sent {
+            write.encode(&ChannelClose {
+                recipient_channel: self.remote_id,
+            })?;
+            self.close_sent = true;
+        }
+        Ok(())
+    }
+}
+
 impl Channel {
     fn confirmation(&self, local_id: u32) -> ChannelOpenConfirmation {
         ChannelOpenConfirmation {
@@ -504,7 +540,6 @@ enum ChannelKind {
     Tcp(TcpConnection),
 }
 
-// Close-handshake state will be added alongside TCP EOF and close handling.
 enum TcpConnection {
     Connecting(Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>),
     Connected(TcpForward<TcpStream>),
@@ -517,6 +552,26 @@ impl TcpConnection {
             && destination.port <= u16::MAX as u32
             && destination.originator_port <= u16::MAX as u32
             && maximum_packet_size != 0
+    }
+
+    fn receive_close(
+        &mut self,
+        flow: &mut ChannelFlow,
+        write: &mut WriteState,
+    ) -> Result<ChannelProgress, Error> {
+        match self {
+            Self::Connecting(_) => {
+                Err(ProtoError::InvalidPacket("channel close before confirmation").into())
+            }
+            Self::Connected(forward) if !forward.pending.is_empty() => {
+                forward.client_close = true;
+                Ok(ChannelProgress::Keep)
+            }
+            Self::Connected(_) | Self::Closed => {
+                flow.send_close(write)?;
+                Ok(ChannelProgress::Remove)
+            }
+        }
     }
 
     fn poll_io(
@@ -533,6 +588,9 @@ impl TcpConnection {
                     *self = Self::Connected(TcpForward {
                         stream,
                         pending: VecDeque::new(),
+                        tcp_eof: false,
+                        write_state: TcpWriteState::Open,
+                        client_close: false,
                     });
                     flow.receive_window = TCP_RECEIVE_WINDOW;
                     confirmation.initial_window_size = TCP_RECEIVE_WINDOW;
@@ -548,20 +606,29 @@ impl TcpConnection {
                 }
                 Poll::Pending => Poll::Pending,
             },
-            Self::Connected(forward) => match forward.poll_write(flow, write, cx) {
+            Self::Connected(forward) => match forward.poll_io(flow, write, cx) {
                 Poll::Ready(Err(Error::Io(error))) => {
-                    debug!(channel = local_id, %error, "TCP socket write failed");
+                    debug!(channel = local_id, %error, "TCP socket I/O failed");
+                    let client_close = forward.client_close;
+                    flow.send_close(write)?;
                     *self = Self::Closed;
-                    flow.close_sent = true;
-                    write.encode(&ChannelClose {
-                        recipient_channel: flow.remote_id,
-                    })?;
+                    // TODO: but what if the write buffer hasn't been emptied out yet.
+                    Poll::Ready(Ok(if client_close {
+                        ChannelProgress::Remove
+                    } else {
+                        ChannelProgress::Keep
+                    }))
+                }
+                Poll::Ready(Ok(ChannelProgress::Keep))
+                    if forward.tcp_eof && forward.write_state == TcpWriteState::Shutdown =>
+                {
+                    flow.send_close(write)?;
+                    *self = Self::Closed;
                     Poll::Ready(Ok(ChannelProgress::Keep))
                 }
                 result => result,
             },
             Self::Closed => Poll::Pending,
-            // TODO: maybe better to error out when it's closed but data is received.
         }
     }
 }
@@ -569,9 +636,73 @@ impl TcpConnection {
 struct TcpForward<T> {
     stream: T,
     pending: VecDeque<u8>,
+    tcp_eof: bool,
+    write_state: TcpWriteState,
+    client_close: bool,
 }
 
-impl<T: AsyncWrite + Unpin> TcpForward<T> {
+#[derive(PartialEq)]
+enum TcpWriteState {
+    Open,
+    Draining,
+    Shutdown,
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> TcpForward<T> {
+    fn poll_io(
+        &mut self,
+        flow: &mut ChannelFlow,
+        write: &mut WriteState,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ChannelProgress, Error>> {
+        // TODO: where is this future being exactly being awaited upon?
+        let written = self.poll_write(flow, write, cx)?;
+        if self.client_close {
+            if !self.pending.is_empty() {
+                return written.map(Ok);
+            }
+            flow.send_close(write)?;
+            return Poll::Ready(Ok(ChannelProgress::Remove));
+        }
+        let read = self.poll_read(flow, write, cx)?;
+        // TODO: isn't this a premise for select!
+        // But are these cancel safe ?
+        if written.is_ready() || read.is_ready() {
+            Poll::Ready(Ok(ChannelProgress::Keep))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_read(
+        &mut self,
+        flow: &mut ChannelFlow,
+        write: &mut WriteState,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ChannelProgress, Error>> {
+        let limit = TCP_READ_LIMIT.min(flow.send_window.min(flow.maximum_packet_size) as usize);
+        if self.tcp_eof || limit == 0 {
+            return Poll::Pending;
+        }
+        let mut bytes = [0; TCP_READ_LIMIT];
+        let mut buffer = ReadBuf::new(&mut bytes[..limit]);
+        core::task::ready!(Pin::new(&mut self.stream).poll_read(cx, &mut buffer))?;
+        let data = buffer.filled();
+        if data.is_empty() {
+            self.tcp_eof = true;
+            write.encode(&ChannelEof {
+                recipient_channel: flow.remote_id,
+            })?;
+            return Poll::Ready(Ok(ChannelProgress::Keep));
+        }
+        write.encode(&ChannelData {
+            recipient_channel: flow.remote_id,
+            data: Cow::Borrowed(data),
+        })?;
+        flow.send_window -= data.len() as u32;
+        Poll::Ready(Ok(ChannelProgress::Keep))
+    }
+
     fn poll_write(
         &mut self,
         flow: &mut ChannelFlow,
@@ -579,6 +710,11 @@ impl<T: AsyncWrite + Unpin> TcpForward<T> {
         cx: &mut Context<'_>,
     ) -> Poll<Result<ChannelProgress, Error>> {
         if self.pending.is_empty() {
+            if self.write_state == TcpWriteState::Draining {
+                core::task::ready!(Pin::new(&mut self.stream).poll_shutdown(cx))?;
+                self.write_state = TcpWriteState::Shutdown;
+                return Poll::Ready(Ok(ChannelProgress::Keep));
+            }
             return Poll::Pending;
         }
 
@@ -592,12 +728,15 @@ impl<T: AsyncWrite + Unpin> TcpForward<T> {
             Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
             Poll::Ready(Ok(count)) => {
                 self.pending.drain(..count);
-                let count = count as u32;
-                flow.receive_window += count;
-                write.encode(&ChannelWindowAdjust {
-                    recipient_channel: flow.remote_id,
-                    bytes_to_add: count,
-                })?;
+                // Sending message to adjust channel window if the SSH connection is active from the client side!
+                if !self.client_close {
+                    let count = count as u32;
+                    flow.receive_window += count;
+                    write.encode(&ChannelWindowAdjust {
+                        recipient_channel: flow.remote_id,
+                        bytes_to_add: count,
+                    })?;
+                }
                 Poll::Ready(Ok(ChannelProgress::Keep))
             }
         }
@@ -852,6 +991,7 @@ impl<'a> TryFrom<IncomingPacket<'a>> for IncomingChannelMessage<'a> {
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_RECEIVE_WINDOW: u32 = 64 * 1024;
+const TCP_READ_LIMIT: usize = 32 * 1024;
 
 const INITIAL_WINDOW_SIZE: u32 = 16 * MAX_PACKET_LEN;
 /// How long to wait for a shell to become reapable after its PTY reports EOF
@@ -874,9 +1014,459 @@ const MAX_OPEN_CHANNELS_PER_SESSION: usize = 256;
 #[cfg(test)]
 mod tests {
     use proto::channels::{ChannelOpenType, DirectTcpip};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    #[tokio::test]
+    async fn tcp_peer_close_drains_queued_data_before_reply() -> anyhow::Result<()> {
+        let mut channels = Channels::default();
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        let mut peer = open_tcp_channel(&mut channels, &mut write).await?;
+        let payload = vec![7; 5000];
+        channels.data(
+            &ChannelData {
+                recipient_channel: 0,
+                data: Cow::Borrowed(&payload),
+            },
+            &mut write,
+        )?;
+        let close = ChannelClose {
+            recipient_channel: 0,
+        };
+        channels.close(&close, &mut write)?;
+        channels.data(
+            &ChannelData {
+                recipient_channel: 0,
+                data: Cow::Borrowed(b"late"),
+            },
+            &mut write,
+        )?;
+        assert!(write.buffered().is_empty());
+
+        poll_channels(&mut channels, &mut write).await?;
+        assert!(channels.channels.contains_key(&0));
+        assert!(write.buffered().is_empty());
+        poll_channels(&mut channels, &mut write).await?;
+        assert!(channels.channels.is_empty());
+        assert_single_close(&write);
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut received)).await??;
+        assert_eq!(received, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_peer_close_waits_for_a_blocked_write_to_drain() {
+        let (mut socket, mut peer) = tokio::io::duplex(1);
+        socket.write_all(b"x").await.unwrap();
+        peer.write_all(b"y").await.unwrap();
+        let mut forward = TcpForward {
+            stream: socket,
+            pending: VecDeque::from(vec![b'z']),
+            tcp_eof: false,
+            write_state: TcpWriteState::Open,
+            client_close: true,
+        };
+        let mut flow = ChannelFlow {
+            remote_id: 42,
+            send_window: 32_768,
+            receive_window: TCP_RECEIVE_WINDOW - 1,
+            maximum_packet_size: 32_768,
+            close_sent: false,
+        };
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        assert!(
+            core::future::poll_fn(|cx| Poll::Ready(forward.poll_io(&mut flow, &mut write, cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(forward.pending.len(), 1);
+        assert!(write.buffered().is_empty());
+
+        assert_eq!(peer.read_u8().await.unwrap(), b'x');
+        let progress = tokio::time::timeout(
+            Duration::from_secs(5),
+            core::future::poll_fn(|cx| forward.poll_io(&mut flow, &mut write, cx)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(progress, ChannelProgress::Remove));
+        assert!(forward.pending.is_empty());
+        assert_eq!(peer.read_u8().await.unwrap(), b'z');
+        assert_eq!(flow.send_window, 32_768);
+        assert_eq!(flow.receive_window, TCP_RECEIVE_WINDOW - 1);
+        assert_single_close(&write);
+    }
+
+    #[tokio::test]
+    async fn tcp_crossed_close_releases_id_without_a_second_reply() -> anyhow::Result<()> {
+        let mut channels = Channels::default();
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        let mut peer = open_tcp_channel(&mut channels, &mut write).await?;
+        peer.shutdown().await?;
+        poll_channels(&mut channels, &mut write).await?;
+        assert_eq!(write.buffered()[5], u8::from(MessageType::ChannelEof));
+        write.clear();
+        channels.eof(&ChannelEof {
+            recipient_channel: 0,
+        })?;
+        poll_channels(&mut channels, &mut write).await?;
+        assert_single_close(&write);
+        assert!(matches!(
+            channels.channels[&0].kind,
+            ChannelKind::Tcp(TcpConnection::Closed)
+        ));
+        write.clear();
+        channels.close(
+            &ChannelClose {
+                recipient_channel: 0,
+            },
+            &mut write,
+        )?;
+        assert!(channels.channels.is_empty());
+        assert!(write.buffered().is_empty());
+
+        channels.next_id = 0;
+        let _peer = open_tcp_channel(&mut channels, &mut write).await?;
+        assert!(channels.channels.contains_key(&0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_socket_error_leaves_other_channels_usable() -> anyhow::Result<()> {
+        let mut channels = Channels::default();
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        let peer = open_tcp_channel(&mut channels, &mut write).await?;
+        let mut other_peer = open_tcp_channel(&mut channels, &mut write).await?;
+        rustix::net::sockopt::set_socket_linger(&peer, Some(Duration::ZERO))?;
+        drop(peer);
+        poll_channels(&mut channels, &mut write).await?;
+        assert_single_close(&write);
+        assert!(matches!(
+            channels.channels[&0].kind,
+            ChannelKind::Tcp(TcpConnection::Closed)
+        ));
+        write.clear();
+        other_peer.write_all(b"ok").await?;
+        poll_channels(&mut channels, &mut write).await?;
+        assert_eq!(write.buffered()[5], u8::from(MessageType::ChannelData));
+        assert_eq!(&write.buffered()[6..10], &43u32.to_be_bytes());
+        assert_eq!(&write.buffered()[14..16], b"ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_disconnect_drops_pending_connects_and_established_sockets() -> anyhow::Result<()> {
+        let mut channels = Channels::default();
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        let mut peer = open_tcp_channel(&mut channels, &mut write).await?;
+        let (connect_guard, dropped) = tokio::sync::oneshot::channel::<()>();
+        channels.channels.insert(
+            1,
+            Channel {
+                flow: ChannelFlow {
+                    remote_id: 43,
+                    send_window: 32_768,
+                    receive_window: 0,
+                    maximum_packet_size: 32_768,
+                    close_sent: false,
+                },
+                kind: ChannelKind::Tcp(TcpConnection::Connecting(Box::pin(async move {
+                    let _guard = connect_guard;
+                    core::future::pending().await
+                }))),
+            },
+        );
+        assert!(
+            core::future::poll_fn(|cx| Poll::Ready(channels.poll_io(&mut write, cx)))
+                .await
+                .is_pending()
+        );
+        drop(channels);
+        assert!(dropped.await.is_err());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), peer.read(&mut [0])).await??,
+            0
+        );
+        Ok(())
+    }
+
+    async fn open_tcp_channel(
+        channels: &mut Channels,
+        write: &mut WriteState,
+    ) -> anyhow::Result<TcpStream> {
+        let target = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        channels.open(
+            ChannelOpen {
+                r#type: ChannelOpenType::DirectTcpip(DirectTcpip {
+                    host: "127.0.0.1",
+                    port: target.local_addr()?.port().into(),
+                    originator_address: "127.0.0.1",
+                    originator_port: 0,
+                }),
+                sender_channel: 42 + channels.next_id,
+                initial_window_size: 32_768,
+                maximum_packet_size: 32_768,
+            },
+            write,
+        )?;
+        poll_channels(channels, write).await?;
+        assert_eq!(
+            write.buffered()[5],
+            u8::from(MessageType::ChannelOpenConfirmation)
+        );
+        write.clear();
+        Ok(target.accept().await?.0)
+    }
+
+    async fn poll_channels(channels: &mut Channels, write: &mut WriteState) -> anyhow::Result<()> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            core::future::poll_fn(|cx| channels.poll_io(write, cx)),
+        )
+        .await??;
+        Ok(())
+    }
+
+    fn assert_single_close(write: &WriteState) {
+        let packet = write.buffered();
+        let len = u32::from_be_bytes(packet[..4].try_into().unwrap()) as usize;
+        assert_eq!(packet.len(), 4 + len);
+        assert_eq!(packet[5], u8::from(MessageType::ChannelClose));
+        assert_eq!(&packet[6..10], &42u32.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn tcp_write_shutdown_waits_for_pending_bytes() {
+        let (socket, mut peer) = tokio::io::duplex(3);
+        let mut forward = TcpForward {
+            stream: socket,
+            pending: VecDeque::from(b"request".to_vec()),
+            tcp_eof: false,
+            write_state: TcpWriteState::Draining,
+            client_close: false,
+        };
+        let mut flow = ChannelFlow {
+            remote_id: 42,
+            send_window: 32_768,
+            receive_window: TCP_RECEIVE_WINDOW - 7,
+            maximum_packet_size: 32_768,
+            close_sent: false,
+        };
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        core::future::poll_fn(|cx| forward.poll_write(&mut flow, &mut write, cx))
+            .await
+            .unwrap();
+        assert_eq!(forward.pending.len(), 4);
+        assert!(matches!(forward.write_state, TcpWriteState::Draining));
+        assert!(
+            core::future::poll_fn(|cx| Poll::Ready(forward.poll_write(&mut flow, &mut write, cx)))
+                .await
+                .is_pending()
+        );
+
+        let drain = async {
+            while forward.write_state != TcpWriteState::Shutdown {
+                core::future::poll_fn(|cx| forward.poll_write(&mut flow, &mut write, cx))
+                    .await
+                    .unwrap();
+            }
+        };
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(drain, peer.read_to_end(&mut received))
+                .1
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, b"request");
+        assert_eq!(flow.receive_window, TCP_RECEIVE_WINDOW);
+
+        write.clear();
+        peer.write_all(b"res").await.unwrap();
+        core::future::poll_fn(|cx| forward.poll_read(&mut flow, &mut write, cx))
+            .await
+            .unwrap();
+        assert_eq!(&write.buffered()[14..17], b"res");
+    }
+
+    #[tokio::test]
+    async fn tcp_read_respects_visit_budget_window_and_packet_size() {
+        let payload = vec![7; TCP_READ_LIMIT + 1];
+        for (window, packet_size, expected) in [
+            (65_536, 65_536, 32 * 1024),
+            (512, 32_768, 512),
+            (32_768, 256, 256),
+        ] {
+            let (socket, mut peer) = tokio::io::duplex(payload.len());
+            peer.write_all(&payload).await.unwrap();
+            let mut forward = TcpForward {
+                stream: socket,
+                pending: VecDeque::new(),
+                tcp_eof: false,
+                write_state: TcpWriteState::Open,
+                client_close: false,
+            };
+            let mut flow = ChannelFlow {
+                remote_id: 42,
+                send_window: window,
+                receive_window: TCP_RECEIVE_WINDOW,
+                maximum_packet_size: packet_size,
+                close_sent: false,
+            };
+            let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+            core::future::poll_fn(|cx| forward.poll_read(&mut flow, &mut write, cx))
+                .await
+                .unwrap();
+            assert_eq!(flow.send_window, window - expected);
+            let packet = write.buffered();
+            assert_eq!(packet[5], u8::from(MessageType::ChannelData));
+            assert_eq!(&packet[6..10], &42u32.to_be_bytes());
+            assert_eq!(&packet[10..14], &expected.to_be_bytes());
+            assert_eq!(
+                &packet[14..14 + expected as usize],
+                &payload[..expected as usize]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_poll_reads_while_socket_write_is_blocked() {
+        let (mut socket, mut peer) = tokio::io::duplex(4);
+        socket.write_all(b"full").await.unwrap();
+        peer.write_all(b"read").await.unwrap();
+        let mut forward = TcpForward {
+            stream: socket,
+            pending: VecDeque::from(vec![1]),
+            tcp_eof: false,
+            write_state: TcpWriteState::Open,
+            client_close: false,
+        };
+        let mut flow = ChannelFlow {
+            remote_id: 42,
+            send_window: 4,
+            receive_window: TCP_RECEIVE_WINDOW - 1,
+            maximum_packet_size: 32_768,
+            close_sent: false,
+        };
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        let progress =
+            core::future::poll_fn(|cx| Poll::Ready(forward.poll_io(&mut flow, &mut write, cx)))
+                .await;
+        assert!(matches!(progress, Poll::Ready(Ok(ChannelProgress::Keep))));
+        assert_eq!(forward.pending.len(), 1);
+        assert_eq!(flow.receive_window, TCP_RECEIVE_WINDOW - 1);
+        assert_eq!(flow.send_window, 0);
+        assert_eq!(&write.buffered()[14..18], b"read");
+    }
+
+    #[tokio::test]
+    async fn tcp_read_resumes_after_window_adjustment() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let stream = TcpStream::connect(listener.local_addr()?).await?;
+        let (mut peer, _) = listener.accept().await?;
+        peer.write_all(b"reply").await?;
+        stream.readable().await?;
+        let mut channels = Channels::default();
+        channels.channels.insert(
+            0,
+            Channel {
+                flow: ChannelFlow {
+                    remote_id: 42,
+                    send_window: 0,
+                    receive_window: TCP_RECEIVE_WINDOW,
+                    maximum_packet_size: 32_768,
+                    close_sent: false,
+                },
+                kind: ChannelKind::Tcp(TcpConnection::Connected(TcpForward {
+                    stream,
+                    pending: VecDeque::new(),
+                    tcp_eof: false,
+                    write_state: TcpWriteState::Open,
+                    client_close: false,
+                })),
+            },
+        );
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        assert!(
+            core::future::poll_fn(|cx| Poll::Ready(channels.poll_io(&mut write, cx)))
+                .await
+                .is_pending()
+        );
+        assert!(write.buffered().is_empty());
+        channels.adjust_window(&ChannelWindowAdjust {
+            recipient_channel: 0,
+            bytes_to_add: 1,
+        })?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            core::future::poll_fn(|cx| channels.poll_io(&mut write, cx)),
+        )
+        .await??;
+        assert_eq!(write.buffered()[5], u8::from(MessageType::ChannelData));
+        assert_eq!(&write.buffered()[10..14], &1u32.to_be_bytes());
+        assert_eq!(write.buffered()[14], b'r');
+        assert_eq!(channels.channels[&0].flow.send_window, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_channel_refuses_pty_requests() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let mut channels = Channels::default();
+        let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
+        channels.open(
+            ChannelOpen {
+                r#type: ChannelOpenType::DirectTcpip(DirectTcpip {
+                    host: "127.0.0.1",
+                    port: listener.local_addr()?.port().into(),
+                    originator_address: "127.0.0.1",
+                    originator_port: 0,
+                }),
+                sender_channel: 42,
+                initial_window_size: 0,
+                maximum_packet_size: 32_768,
+            },
+            &mut write,
+        )?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            core::future::poll_fn(|cx| channels.poll_io(&mut write, cx)),
+        )
+        .await??;
+        write.clear();
+
+        for want_reply in [false, true] {
+            channels.request(
+                ChannelRequest {
+                    recipient_channel: 0,
+                    r#type: ChannelRequestType::PtyReq(PtyReq {
+                        term: Cow::Borrowed("xterm"),
+                        cols: 80,
+                        rows: 24,
+                        width_px: 0,
+                        height_px: 0,
+                        terminal_modes: BTreeMap::new(),
+                    }),
+                    want_reply,
+                },
+                &mut write,
+                None,
+                &KeyOptions::default(),
+            )?;
+            if want_reply {
+                assert_eq!(write.buffered()[5], u8::from(MessageType::ChannelFailure));
+                assert_eq!(&write.buffered()[6..10], &42u32.to_be_bytes());
+            } else {
+                assert!(write.buffered().is_empty());
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn tcp_write_is_limited_to_four_kib_per_poll() {
@@ -884,6 +1474,9 @@ mod tests {
         let mut forward = TcpForward {
             stream: socket,
             pending: VecDeque::from(vec![7; 6000]),
+            tcp_eof: false,
+            write_state: TcpWriteState::Open,
+            client_close: false,
         };
         let mut flow = ChannelFlow {
             remote_id: 1,
@@ -907,6 +1500,9 @@ mod tests {
         let mut forward = TcpForward {
             stream: socket,
             pending: VecDeque::from(b"abcdefgh".to_vec()),
+            tcp_eof: false,
+            write_state: TcpWriteState::Open,
+            client_close: false,
         };
         let mut flow = ChannelFlow {
             remote_id: 42,
@@ -1012,6 +1608,9 @@ mod tests {
                 kind: ChannelKind::Tcp(TcpConnection::Connected(TcpForward {
                     stream,
                     pending: VecDeque::new(),
+                    tcp_eof: false,
+                    write_state: TcpWriteState::Open,
+                    client_close: false,
                 })),
             },
         );

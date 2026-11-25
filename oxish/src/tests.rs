@@ -354,7 +354,7 @@ async fn direct_tcpip_connects_before_confirmation() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn direct_tcpip_sends_data_to_destination() -> anyhow::Result<()> {
+async fn direct_tcpip_relays_data_in_both_directions() -> anyhow::Result<()> {
     let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let (_key_dir, mut client, server) = setup(
         &PublicKeyAlgorithm::Ed25519,
@@ -372,22 +372,123 @@ async fn direct_tcpip_sends_data_to_destination() -> anyhow::Result<()> {
         .cmd
         .arg(format!("{USER}@{}", client.addr.ip()))
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
     let mut stdin = child.stdin.take().context("missing SSH stdin")?;
-    let payload = b"forwarded TCP data\0".repeat(10_000);
-    let mut received = vec![0; payload.len()];
+    let mut stdout = child.stdout.take().context("missing SSH stdout")?;
+    let request = b"client to destination\0".repeat(10_000);
+    let response = b"destination to client\0".repeat(110_000);
+    let mut received_request = vec![0; request.len()];
+    let mut received_response = vec![0; response.len()];
     timeout(Duration::from_secs(15), async {
         let (mut stream, _) = target.accept().await?;
-        tokio::try_join!(stdin.write_all(&payload), stream.read_exact(&mut received))?;
+        let (mut read, mut write) = stream.split();
+        tokio::try_join!(
+            stdin.write_all(&request),
+            read.read_exact(&mut received_request),
+            write.write_all(&response),
+            stdout.read_exact(&mut received_response),
+        )?;
         Ok::<_, anyhow::Error>(())
     })
     .await??;
-    assert_eq!(received, payload);
+    assert_eq!(received_request, request);
+    assert_eq!(received_response, response);
     child.kill().await?;
     let _ = timeout(Duration::from_secs(10), server).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_tcpip_propagates_half_closes() -> anyhow::Result<()> {
+    for client_sends_eof_first in [true, false] {
+        let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let socket_dir = TempDir::new()?;
+        let socket = socket_dir.path().join("forward");
+        let (_key_dir, mut client, server) = setup(
+            &PublicKeyAlgorithm::Ed25519,
+            None,
+            None,
+            crate::DEFAULT_PROVIDER,
+        )
+        .await?;
+        client
+            .cmd
+            .args(["-N", "-T", "-o", "ExitOnForwardFailure=yes", "-L"])
+            .arg(format!("{}:{}", socket.display(), target.local_addr()?));
+        let mut child = client
+            .cmd
+            .arg(format!("{USER}@{}", client.addr.ip()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut stderr = BufReader::new(child.stderr.take().context("missing SSH stderr")?).lines();
+        let request = b"request\0".repeat(10_000);
+        let response = b"response\0".repeat(10_000);
+        let transfer = async {
+            loop {
+                let line = stderr
+                    .next_line()
+                    .await?
+                    .context("SSH exited before listening")?;
+                if line.contains("Local forwarding listening on path") {
+                    break;
+                }
+            }
+            let mut local = tokio::net::UnixStream::connect(&socket).await?;
+            let (mut remote, _) = target.accept().await?;
+            let (mut local_read, mut local_write) = local.split();
+            let (mut remote_read, mut remote_write) = remote.split();
+            let mut received_request = Vec::new();
+            let mut received_response = Vec::new();
+            let upload = async {
+                let send = async {
+                    local_write.write_all(&request).await?;
+                    local_write.shutdown().await
+                };
+                tokio::try_join!(send, remote_read.read_to_end(&mut received_request))?;
+                Ok::<_, io::Error>(())
+            };
+            let download = async {
+                let send = async {
+                    remote_write.write_all(&response).await?;
+                    remote_write.shutdown().await
+                };
+                tokio::try_join!(send, local_read.read_to_end(&mut received_response))?;
+                Ok::<_, io::Error>(())
+            };
+            if client_sends_eof_first {
+                upload.await?;
+                download.await?;
+            } else {
+                download.await?;
+                upload.await?;
+            }
+            assert_eq!(received_request, request);
+            assert_eq!(received_response, response);
+            loop {
+                let line = stderr
+                    .next_line()
+                    .await?
+                    .context("SSH exited before receiving channel close")?;
+                if line.contains("rcvd close") {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        timeout(Duration::from_secs(15), transfer)
+            .await
+            .with_context(|| {
+                format!("half-close timed out with client EOF first = {client_sends_eof_first}")
+            })??;
+        child.kill().await?;
+        let _ = timeout(Duration::from_secs(10), server).await?;
+    }
     Ok(())
 }
 

@@ -62,6 +62,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
     pub async fn run(mut self) -> Result<(), Error> {
         loop {
             tokio::select! {
+            // TODO: are these futures cancel safe ?
                 result = receive(&mut self.conn.stream, &mut self.conn.read) => {
                     let packet = result?;
                     let kx = packet.message_type == MessageType::KeyExchangeInit
