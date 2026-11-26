@@ -13,7 +13,7 @@ use crate::{
 #[derive(Debug)]
 pub struct ChannelOpen<'a> {
     /// The channel type to open
-    pub r#type: ChannelOpenType<'a>,
+    pub r#type: ChannelType<'a>,
     /// The sender's identifier for the channel
     pub sender_channel: u32,
     /// Initial number of bytes the sender is willing to receive
@@ -46,16 +46,14 @@ impl<'a> TryFrom<IncomingPacket<'a>> for ChannelOpen<'a> {
         } = u32::decode(next)?;
 
         let r#type = match name {
-            ChannelTypeName::Session if next.is_empty() => ChannelOpenType::Session,
+            ChannelTypeName::Session if next.is_empty() => ChannelType::Session,
             ChannelTypeName::Session => {
                 return Err(ProtoError::InvalidPacket(
                     "extra data in channel open packet",
                 ));
             }
-            ChannelTypeName::DirectTcpip => {
-                ChannelOpenType::DirectTcpip(DirectTcpip::decode(next)?)
-            }
-            ChannelTypeName::Unknown(name) => ChannelOpenType::Unknown(name),
+            ChannelTypeName::DirectTcpip => ChannelType::DirectTcpip(DirectTcpip::decode(next)?),
+            ChannelTypeName::Unknown(name) => ChannelType::Unknown(name),
         };
 
         Ok(Self {
@@ -67,15 +65,21 @@ impl<'a> TryFrom<IncomingPacket<'a>> for ChannelOpen<'a> {
     }
 }
 
-#[doc = "The channel type and its type-specific fields in a [`ChannelOpen`]."]
+/// Channel types for `SSH_MSG_CHANNEL_OPEN`
+///
+/// See <https://www.rfc-editor.org/rfc/rfc4250#section-4.9.1>.
 #[non_exhaustive]
 #[derive(Debug, Eq, PartialEq)]
-pub enum ChannelOpenType<'a> {
-    #[doc = "A `session` channel."]
+pub enum ChannelType<'a> {
+    /// `session`
+    ///
+    /// As defined in <https://www.rfc-editor.org/rfc/rfc4254#section-6.1>.
     Session,
-    #[doc = "A `direct-tcpip` channel opened for local TCP forwarding."]
+    /// `direct-tcpip`
+    ///
+    /// As defined in <https://www.rfc-editor.org/rfc/rfc4254#section-7.2>.
     DirectTcpip(DirectTcpip<'a>),
-    #[doc = "An unrecognized channel type, identified by its wire name."]
+    /// A channel type not known to this implementation
     Unknown(&'a str),
 }
 

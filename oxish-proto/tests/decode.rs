@@ -1,6 +1,6 @@
 use oxish_proto::{
     Completion, Encode, IncomingPacket, MessageType, ProtoError, ReadState,
-    channels::{ChannelOpen, ChannelOpenType, DirectTcpip},
+    channels::{ChannelOpen, ChannelType, DirectTcpip},
 };
 
 #[test]
@@ -28,7 +28,7 @@ fn direct_tcpip_addresses() {
         assert_eq!(open.maximum_packet_size, 32_768);
         assert_eq!(
             open.r#type,
-            ChannelOpenType::DirectTcpip(DirectTcpip {
+            ChannelType::DirectTcpip(DirectTcpip {
                 host,
                 port: 8080,
                 originator_address: "::1",
@@ -82,7 +82,7 @@ fn direct_tcpip_trailing_data() {
 fn session_channel_open_has_no_type_specific_fields() {
     let mut state = ReadState::default();
     let open = decode_channel_open(b"session", &[], &mut state).unwrap();
-    assert_eq!(open.r#type, ChannelOpenType::Session);
+    assert_eq!(open.r#type, ChannelType::Session);
 
     let mut state = ReadState::default();
     assert!(matches!(
@@ -95,7 +95,7 @@ fn session_channel_open_has_no_type_specific_fields() {
 fn unknown_channel_open_keeps_wire_name() {
     let mut state = ReadState::default();
     let open = decode_channel_open(b"vendor-channel", &[0], &mut state).unwrap();
-    assert_eq!(open.r#type, ChannelOpenType::Unknown("vendor-channel"));
+    assert_eq!(open.r#type, ChannelType::Unknown("vendor-channel"));
 }
 
 #[test]

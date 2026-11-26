@@ -19,8 +19,8 @@ use proto::{
     auth::KeyOptions,
     channels::{
         ChannelClose, ChannelData, ChannelEof, ChannelOpen, ChannelOpenConfirmation,
-        ChannelOpenFailure, ChannelOpenType, ChannelRequest, ChannelRequestFailure,
-        ChannelRequestSuccess, ChannelRequestType, ChannelWindowAdjust, DirectTcpip, PtyReq,
+        ChannelOpenFailure, ChannelRequest, ChannelRequestFailure, ChannelRequestSuccess,
+        ChannelRequestType, ChannelType, ChannelWindowAdjust, DirectTcpip, PtyReq,
     },
 };
 use tokio::{
@@ -44,8 +44,8 @@ impl Channels {
         write: &mut WriteState,
     ) -> Result<(), Error> {
         let kind = match open.r#type {
-            ChannelOpenType::Session => ChannelKind::Session(Box::default()),
-            ChannelOpenType::DirectTcpip(destination) => {
+            ChannelType::Session => ChannelKind::Session(Box::default()),
+            ChannelType::DirectTcpip(destination) => {
                 if !TcpConnection::valid_destination(&destination, open.maximum_packet_size) {
                     write.encode(&ChannelOpenFailure::administratively_prohibited(
                         open.sender_channel,
@@ -1018,7 +1018,7 @@ const MAX_OPEN_CHANNELS_PER_SESSION: usize = 256;
 
 #[cfg(test)]
 mod tests {
-    use proto::channels::{ChannelOpenType, DirectTcpip};
+    use proto::channels::{ChannelType, DirectTcpip};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -1206,7 +1206,7 @@ mod tests {
         let target = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         channels.open(
             ChannelOpen {
-                r#type: ChannelOpenType::DirectTcpip(DirectTcpip {
+                r#type: ChannelType::DirectTcpip(DirectTcpip {
                     host: "127.0.0.1",
                     port: target.local_addr()?.port().into(),
                     originator_address: "127.0.0.1",
@@ -1426,7 +1426,7 @@ mod tests {
         let mut write = WriteState::new(crate::DEFAULT_PROVIDER.secure_random());
         channels.open(
             ChannelOpen {
-                r#type: ChannelOpenType::DirectTcpip(DirectTcpip {
+                r#type: ChannelType::DirectTcpip(DirectTcpip {
                     host: "127.0.0.1",
                     port: listener.local_addr()?.port().into(),
                     originator_address: "127.0.0.1",
@@ -1655,7 +1655,7 @@ mod tests {
             channels
                 .open(
                     ChannelOpen {
-                        r#type: ChannelOpenType::DirectTcpip(DirectTcpip {
+                        r#type: ChannelType::DirectTcpip(DirectTcpip {
                             host,
                             port,
                             originator_address: "127.0.0.1",
@@ -1683,7 +1683,7 @@ mod tests {
         channels
             .open(
                 ChannelOpen {
-                    r#type: ChannelOpenType::Session,
+                    r#type: ChannelType::Session,
                     sender_channel: 7,
                     initial_window_size: 0,
                     maximum_packet_size: 32768,
@@ -1694,7 +1694,7 @@ mod tests {
         channels
             .open(
                 ChannelOpen {
-                    r#type: ChannelOpenType::DirectTcpip(DirectTcpip {
+                    r#type: ChannelType::DirectTcpip(DirectTcpip {
                         host: "127.0.0.1",
                         port: 22,
                         originator_address: "127.0.0.1",
@@ -1747,7 +1747,7 @@ mod tests {
         channels
             .open(
                 ChannelOpen {
-                    r#type: ChannelOpenType::Session,
+                    r#type: ChannelType::Session,
                     sender_channel: 2,
                     initial_window_size: 0,
                     maximum_packet_size: 32768,
