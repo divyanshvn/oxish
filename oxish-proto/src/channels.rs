@@ -56,7 +56,7 @@ impl<'a> TryFrom<IncomingPacket<'a>> for ChannelOpen<'a> {
             ChannelTypeName::Unknown(name) => ChannelType::Unknown(name),
         };
 
-        Ok(Self {
+        Ok(ChannelOpen {
             r#type,
             sender_channel,
             initial_window_size,
@@ -186,7 +186,9 @@ impl<'a> ChannelOpenFailure<'a> {
             description,
         }
     }
+}
 
+impl ChannelOpenFailure<'static> {
     #[doc = "Failure response when a destination connection fails."]
     pub fn destination_failed(recipient_channel: u32) -> Self {
         Self {
@@ -204,9 +206,7 @@ impl<'a> ChannelOpenFailure<'a> {
             description: "too many open channels",
         }
     }
-}
 
-impl ChannelOpenFailure<'static> {
     /// Failure response for a channel open with too many open channels
     pub fn connect_failed(recipient_channel: u32) -> Self {
         Self {
@@ -251,6 +251,7 @@ impl Encode for ChannelOpenFailure<'_> {
     }
 }
 
+#[expect(dead_code)]
 #[repr(u32)]
 #[derive(Clone, Copy, Debug)]
 enum ChannelOpenFailureReason {
