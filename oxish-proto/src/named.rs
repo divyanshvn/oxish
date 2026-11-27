@@ -115,10 +115,20 @@ impl<'a> Named<'a> for ExtensionName<'a> {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum ChannelTypeName<'a> {
+/// Channel types for `SSH_MSG_CHANNEL_OPEN`
+///
+/// See <https://www.rfc-editor.org/rfc/rfc4250#section-4.9.1>.
+#[derive(Debug, PartialEq)]
+pub enum ChannelTypeName<'a> {
+    /// `session`
+    ///
+    /// As defined in <https://www.rfc-editor.org/rfc/rfc4254#section-6.1>.
     Session,
+    /// `direct-tcpip`
+    ///
+    /// As defined in <https://www.rfc-editor.org/info/rfc4254/#section-7.2>.
     DirectTcpip,
+    /// A channel type not known to this implementation
     Unknown(&'a str),
 }
 
